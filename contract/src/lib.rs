@@ -1836,10 +1836,9 @@ fn record_keeper_stake_checkpoint(env: &Env, keeper: &Address, stake: i128) {
 fn calculate_keeper_twas(env: &Env, keeper: &Address) -> i128 {
     let now = env.ledger().timestamp();
     let window_start = now.saturating_sub(KEEPER_TWAS_WINDOW_SECONDS);
-    let window = now.saturating_sub(window_start);
-    if window == 0 {
-        return 0;
-    }
+    // Always divide by the full 30-day window. Before the contract has
+    // accumulated 30 days of history, the pre-history interval contributes zero.
+    let window = KEEPER_TWAS_WINDOW_SECONDS;
 
     let history: Vec<KeeperStakeCheckpoint> = env
         .storage()
@@ -11112,15 +11111,9 @@ impl SoroTaskContract {
         }
 
         let seed = Self::get_keeper_random_seed(env.clone());
-        let mut buf = Bytes::new(&env);
-        buf.append(&seed.to_bytes());
-        buf.append(&task_id.to_xdr(&env));
-
-        let hash: BytesN<32> = env.crypto().sha256(&buf).into();
-        let hash_arr = hash.to_array();
-        let index = (hash_arr[0] as u32) % keepers.len();
-
-        let selected = keepers.get(index).unwrap();
+        let random_number = Self::vrf_random_number(seed.to_array().as_slice());
+        let selected =
+            Self::select_keeper_from_vrf_seed(&env, task_id, 0, random_number, &keepers);
 
         env.events().publish(
             (
@@ -16197,3 +16190,49 @@ mod test_state_channel;
 
 #[cfg(test)]
 mod test_booster;
+
+
+#[cfg(test)]
+mod keeper_twas_tests {
+    use super::*;
+
+    #[test]
+    fn instantaneous_stake_has_zero_twas_weight() {
+        let env = Env::default();
+        let keeper = Address::generate(&env);
+        env.ledger().with_mut(|ledger| ledger.timestamp = 1_000);
+
+        record_keeper_stake_checkpoint(&env, &keeper, 5_000);
+        assert_eq!(calculate_keeper_twas(&env, &keeper), 0);
+    }
+
+    #[test]
+    fn twas_integrates_stake_changes_over_the_full_thirty_day_window() {
+        let env = Env::default();
+        let keeper = Address::generate(&env);
+        let start = 1_000u64;
+        env.ledger().with_mut(|ledger| ledger.timestamp = start);
+
+        record_keeper_stake_checkpoint(&env, &keeper, 1_000);
+        env.ledger().with_mut(|ledger| {
+            ledger.timestamp = start + KEEPER_TWAS_WINDOW_SECONDS / 2;
+        });
+        record_keeper_stake_checkpoint(&env, &keeper, 10_000);
+
+        env.ledger().with_mut(|ledger| {
+            ledger.timestamp = start + KEEPER_TWAS_WINDOW_SECONDS;
+        });
+        assert_eq!(calculate_keeper_twas(&env, &keeper), 5_500);
+    }
+
+    #[test]
+    fn same_timestamp_stake_updates_do_not_accrue_time_weight() {
+        let env = Env::default();
+        let keeper = Address::generate(&env);
+        env.ledger().with_mut(|ledger| ledger.timestamp = 1_000);
+
+        record_keeper_stake_checkpoint(&env, &keeper, 1_000);
+        record_keeper_stake_checkpoint(&env, &keeper, 50_000);
+        assert_eq!(calculate_keeper_twas(&env, &keeper), 0);
+    }
+}
