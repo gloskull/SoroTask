@@ -337,6 +337,15 @@ pub struct KeeperBond {
     pub is_slashed: bool,
 }
 
+/// A point-in-time snapshot of a keeper's eligible bonded and delegated stake.
+/// Each checkpoint applies until the next checkpoint.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeeperStakeCheckpoint {
+    pub timestamp: u64,
+    pub stake: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
@@ -419,6 +428,9 @@ const MAX_LOCKUP_DURATION_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 /// Minimum stake a keeper must bond to claim restricted tasks (Issue #1043), in token units.
 const MIN_KEEPER_STAKE: i128 = 500;
+
+/// TWAS is calculated over the trailing 30-day window.
+pub const KEEPER_TWAS_WINDOW_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 /// Cleanup bounty percentage (1% of refunded gas balance)
 const CLEANUP_BOUNTY_BPS: u32 = 100;
@@ -1363,6 +1375,8 @@ pub enum DataKey {
     VrfCommit(u64),
     /// Keeper economic bond storage (Issue #1043)
     KeeperBond(Address),
+    /// Timestamped stake checkpoints used for the trailing 30-day TWAS.
+    KeeperStakeHistory(Address),
     KeeperSlashCount(Address),
     PendingOptimisticClaims(Address),
     /// Whitelist of keepers allowed to claim restricted tasks
@@ -1761,6 +1775,101 @@ fn set_keeper_stake(env: &Env, keeper: &Address, amount: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::KeeperStake(keeper.clone()), &amount);
+}
+
+/// Returns the keeper's currently eligible stake: unslashed self-bond plus
+/// active delegated stake. A slashed bond contributes no self-bond weight.
+fn current_keeper_eligible_stake(env: &Env, keeper: &Address) -> i128 {
+    let bonded = env
+        .storage()
+        .persistent()
+        .get::<DataKey, KeeperBond>(&DataKey::KeeperBond(keeper.clone()))
+        .filter(|bond| !bond.is_slashed)
+        .map(|bond| bond.bonded_amount)
+        .unwrap_or(0);
+    bonded.saturating_add(get_keeper_total_delegated(env, keeper))
+}
+
+/// Record an effective stake change. Multiple changes in one ledger timestamp
+/// are coalesced so an intra-ledger top-up cannot accrue any time weight.
+fn record_keeper_stake_checkpoint(env: &Env, keeper: &Address, stake: i128) {
+    let now = env.ledger().timestamp();
+    let cutoff = now.saturating_sub(KEEPER_TWAS_WINDOW_SECONDS);
+    let history: Vec<KeeperStakeCheckpoint> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::KeeperStakeHistory(keeper.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+
+    // Keep only the most recent checkpoint at/before the window boundary,
+    // plus every checkpoint inside the window. This bounds storage growth.
+    let mut baseline: Option<KeeperStakeCheckpoint> = None;
+    let mut recent: Vec<KeeperStakeCheckpoint> = Vec::new(env);
+    for i in 0..history.len() {
+        let checkpoint = history.get(i).unwrap();
+        if checkpoint.timestamp <= cutoff {
+            baseline = Some(checkpoint);
+        } else if checkpoint.timestamp < now {
+            recent.push_back(checkpoint);
+        }
+    }
+
+    let mut compacted: Vec<KeeperStakeCheckpoint> = Vec::new(env);
+    if let Some(checkpoint) = baseline {
+        compacted.push_back(checkpoint);
+    }
+    for i in 0..recent.len() {
+        compacted.push_back(recent.get(i).unwrap());
+    }
+    compacted.push_back(KeeperStakeCheckpoint {
+        timestamp: now,
+        stake: stake.max(0),
+    });
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::KeeperStakeHistory(keeper.clone()), &compacted);
+}
+
+/// Calculate the exact time-weighted average eligible stake over the trailing
+/// 30 days. A checkpoint's stake is integrated until the next checkpoint.
+fn calculate_keeper_twas(env: &Env, keeper: &Address) -> i128 {
+    let now = env.ledger().timestamp();
+    let window_start = now.saturating_sub(KEEPER_TWAS_WINDOW_SECONDS);
+    let window = now.saturating_sub(window_start);
+    if window == 0 {
+        return 0;
+    }
+
+    let history: Vec<KeeperStakeCheckpoint> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::KeeperStakeHistory(keeper.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+
+    let mut active_stake: i128 = 0;
+    let mut cursor = window_start;
+    let mut integral: i128 = 0;
+
+    for i in 0..history.len() {
+        let checkpoint = history.get(i).unwrap();
+        if checkpoint.timestamp <= window_start {
+            active_stake = checkpoint.stake.max(0);
+            continue;
+        }
+        if checkpoint.timestamp > now {
+            break;
+        }
+
+        let elapsed = checkpoint.timestamp.saturating_sub(cursor);
+        integral = integral.saturating_add(active_stake.saturating_mul(elapsed as i128));
+        active_stake = checkpoint.stake.max(0);
+        cursor = checkpoint.timestamp;
+    }
+
+    let remaining = now.saturating_sub(cursor);
+    integral = integral.saturating_add(active_stake.saturating_mul(remaining as i128));
+    integral / window as i128
 }
 
 fn get_total_task_escrows(env: &Env) -> i128 {
@@ -6726,6 +6835,11 @@ impl SoroTaskContract {
             .set(&DataKey::DelegationPool(delegator.clone()), &pool);
 
         update_keeper_total_delegated(&env, &keeper, amount);
+        record_keeper_stake_checkpoint(
+            &env,
+            &keeper,
+            current_keeper_eligible_stake(&env, &keeper),
+        );
 
         events::EventLogger::log_delegation_pool_event(
             &env,
@@ -6772,6 +6886,11 @@ impl SoroTaskContract {
 
         update_keeper_total_delegated(&env, &keeper, -amount);
         sub_total_keeper_stakes(&env, amount);
+        record_keeper_stake_checkpoint(
+            &env,
+            &keeper,
+            current_keeper_eligible_stake(&env, &keeper),
+        );
 
         let token_address: Address = env
             .storage()
@@ -6867,6 +6986,11 @@ impl SoroTaskContract {
         env.storage()
             .persistent()
             .set(&DataKey::KeeperBond(keeper.clone()), &bond);
+        record_keeper_stake_checkpoint(
+            &env,
+            &keeper,
+            bonded_amount.saturating_add(get_keeper_total_delegated(&env, &keeper)),
+        );
 
         env.events().publish(
             (
@@ -6926,6 +7050,11 @@ impl SoroTaskContract {
         env.storage()
             .persistent()
             .remove(&DataKey::KeeperBond(keeper.clone()));
+        record_keeper_stake_checkpoint(
+            &env,
+            &keeper,
+            get_keeper_total_delegated(&env, &keeper),
+        );
 
         env.events().publish(
             (
@@ -6955,6 +7084,12 @@ impl SoroTaskContract {
     /// Returns the keeper's bond status.
     pub fn get_keeper_bond(env: Env, keeper: Address) -> Option<KeeperBond> {
         env.storage().persistent().get(&DataKey::KeeperBond(keeper))
+    }
+
+    /// Returns the keeper's trailing 30-day time-weighted average eligible stake.
+    /// Newly bonded or delegated amounts contribute zero weight until time elapses.
+    pub fn get_keeper_twas(env: Env, keeper: Address) -> i128 {
+        calculate_keeper_twas(&env, &keeper)
     }
 
     /// Slashes a keeper's stake and redistributes according to Issue #1043:
@@ -7029,6 +7164,11 @@ impl SoroTaskContract {
                 .persistent()
                 .set(&DataKey::KeeperBond(keeper.clone()), &bond);
         }
+        record_keeper_stake_checkpoint(
+            &env,
+            &keeper,
+            current_keeper_eligible_stake(&env, &keeper),
+        );
 
         // 50/50 split: 50% to protocol treasury, 50% to whistleblower
         let treasury_share = total_slashed / 2;
@@ -10828,11 +10968,42 @@ impl SoroTaskContract {
 
         let hash: BytesN<32> = env.crypto().sha256(&buf).into();
         let hash_arr = hash.to_array();
-        let index_seed = ((hash_arr[0] as u32) << 24)
-            | ((hash_arr[1] as u32) << 16)
-            | ((hash_arr[2] as u32) << 8)
-            | hash_arr[3] as u32;
-        keepers.get(index_seed % keepers.len()).unwrap()
+
+        // Use TWAS as the lottery weight. An instantaneous top-up therefore
+        // cannot increase assignment probability in the same ledger. If no
+        // candidate has accrued any time weight yet, retain unbiased VRF
+        // selection so a newly launched keeper set is not permanently stuck.
+        let mut total_weight: i128 = 0;
+        for i in 0..keepers.len() {
+            let candidate = keepers.get(i).unwrap();
+            total_weight = total_weight.saturating_add(calculate_keeper_twas(env, &candidate));
+        }
+
+        if total_weight <= 0 {
+            let index_seed = ((hash_arr[0] as u32) << 24)
+                | ((hash_arr[1] as u32) << 16)
+                | ((hash_arr[2] as u32) << 8)
+                | hash_arr[3] as u32;
+            return keepers.get(index_seed % keepers.len()).unwrap();
+        }
+
+        let mut seed_value: u128 = 0;
+        for byte in hash_arr.iter().take(16) {
+            seed_value = (seed_value << 8) | (*byte as u128);
+        }
+        let winning_weight = (seed_value % (total_weight as u128)) as i128;
+        let mut cumulative_weight: i128 = 0;
+        for i in 0..keepers.len() {
+            let candidate = keepers.get(i).unwrap();
+            cumulative_weight = cumulative_weight
+                .saturating_add(calculate_keeper_twas(env, &candidate));
+            if winning_weight < cumulative_weight {
+                return candidate;
+            }
+        }
+
+        // Defensive fallback for integer-boundary edge cases.
+        keepers.get(keepers.len() - 1).unwrap()
     }
 
     fn vrf_signature_payload(env: &Env, request_id: u64, task_id: u64) -> Bytes {
